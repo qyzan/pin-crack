@@ -334,7 +334,11 @@ final class Application
             ));
         }
 
-        $console->info(sprintf("  targets    : %d hashes\n", $targetCount));
+        $console->info(sprintf(
+            "  targets    : %d %s\n",
+            $targetCount,
+            $targetCount === 1 ? 'hash' : 'hashes'
+        ));
 
         if ($options->include !== []) {
             $console->info(sprintf("  include    : %s\n", implode(', ', $options->include)));
