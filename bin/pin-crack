@@ -1,0 +1,50 @@
+#!/usr/bin/env php
+<?php
+
+/**
+ * pin-crack - offline recovery of short secrets from leaked password hashes.
+ *
+ * For authorized security testing only.
+ */
+
+declare(strict_types=1);
+
+if (PHP_SAPI !== 'cli') {
+    fwrite(STDERR, "pin-crack must be run from the command line\n");
+    exit(2);
+}
+
+if (PHP_VERSION_ID < 80100) {
+    fwrite(STDERR, 'pin-crack needs PHP 8.1 or newer, found ' . PHP_VERSION . "\n");
+    exit(2);
+}
+
+$autoloaders = [
+    __DIR__ . '/../vendor/autoload.php',   // cloned repo with composer install
+    __DIR__ . '/../../../autoload.php',    // installed as a composer dependency
+    __DIR__ . '/../src/autoload.php',      // bare clone, no composer
+];
+
+$loaded = false;
+foreach ($autoloaders as $autoloader) {
+    if (is_file($autoloader)) {
+        require $autoloader;
+        $loaded = true;
+        break;
+    }
+}
+
+if (!$loaded) {
+    fwrite(STDERR, "cannot find an autoloader - is the checkout complete?\n");
+    exit(2);
+}
+
+$arguments = $argv;
+array_shift($arguments);
+
+$entryPoint = realpath(__FILE__);
+if ($entryPoint === false) {
+    $entryPoint = __FILE__;
+}
+
+exit((new PinCrack\Cli\Application($entryPoint))->run(array_values($arguments)));

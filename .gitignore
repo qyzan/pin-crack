@@ -1,0 +1,22 @@
+/vendor/
+/composer.lock
+/.phpunit.cache/
+/.phpunit.result.cache
+/phpunit.xml
+/phpstan.neon
+/.php-cs-fixer.php
+/.php-cs-fixer.cache
+
+# Working output - never commit engagement material
+/.pin-crack-progress.json
+*.pin-crack-progress.json
+/hashes.txt
+/recovered.txt
+/wordlist.txt
+*.idx
+
+# Editors / OS
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db

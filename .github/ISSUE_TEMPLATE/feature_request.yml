@@ -1,0 +1,32 @@
+name: Feature request
+description: Suggest a capability or a change
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please read the non-goals in
+        [docs/ARCHITECTURE.md](../blob/main/docs/ARCHITECTURE.md) first: no
+        runtime dependencies, no network access, no GPU, no rule engine.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that the tool cannot do today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Including the command line you would expect to type.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Including whether an existing cracker already does this better.

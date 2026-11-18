@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security issue in pin-crack itself
+    url: https://github.com/qyzan/pin-crack/security/advisories/new
+    about: Report privately instead of opening a public issue. See SECURITY.md.
+  - name: Help attacking a system
+    url: https://github.com/qyzan/pin-crack/blob/main/SECURITY.md
+    about: Out of scope. This tool is for authorized testing only.

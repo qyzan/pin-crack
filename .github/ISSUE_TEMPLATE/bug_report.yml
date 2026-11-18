@@ -1,0 +1,67 @@
+name: Bug report
+description: Something does not work the way it is documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not include real hashes, recovered secrets, client names or
+        hostnames.** Reproduce with a synthetic hash, for example:
+        `php -r 'echo password_hash("1234", PASSWORD_BCRYPT, ["cost" => 4]);'`
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, and what happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command line
+      description: The exact command, with any hash replaced by a synthetic one.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: php
+    attributes:
+      label: PHP version
+      description: Output of `php -v` (first line).
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Windows 11 / Ubuntu 24.04 / macOS 15
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: pin-crack version
+      description: Output of `php bin/pin-crack --version`, or the commit hash.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmation
+      options:
+        - label: This report contains no real hashes, secrets or client material.
+          required: true
