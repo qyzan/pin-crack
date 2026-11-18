@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace PinCrack\Tests\Integration;
 
+use PinCrack\Support\Filesystem;
+use PinCrack\Support\Json;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -236,5 +238,195 @@ final class CliTest extends TestCase
         self::assertNull($state['found']);
 
         @unlink($checkpoint);
+    }
+
+    /**
+     * The worker count is no longer part of a checkpoint's identity, so a
+     * sweep started with one pool size resumes with another. It used to be
+     * rejected, and the rejected file was then overwritten.
+     */
+    public function testResumeWorksAfterChangingTheWorkerCount(): void
+    {
+        $checkpoint = tempnam(sys_get_temp_dir(), 'pcckpt_');
+        self::assertIsString($checkpoint);
+        @unlink($checkpoint);
+
+        $hash = password_hash('999999', PASSWORD_BCRYPT, ['cost' => 8]);
+        $common = ['--hash', $hash, '--full', '--checkpoint', $checkpoint,
+                   '--max-hours', '0.0003', '--guard', '0'];
+
+        $first = $this->runCli(array_merge($common, ['--workers', '6', '--quiet']));
+        self::assertSame(3, $first['code'], $first['output']);
+
+        $before = json_decode((string) file_get_contents($checkpoint), true);
+        self::assertIsArray($before);
+        self::assertGreaterThan(0, $before['tried']);
+
+        $second = $this->runCli(array_merge($common, ['--workers', '3', '--resume']));
+        self::assertSame(3, $second['code'], $second['output']);
+        self::assertStringContainsString('resuming from checkpoint', $second['output']);
+
+        $after = json_decode((string) file_get_contents($checkpoint), true);
+        self::assertIsArray($after);
+        self::assertGreaterThan(
+            $before['tried'],
+            $after['tried'],
+            'progress must accumulate across the worker-count change'
+        );
+
+        @unlink($checkpoint);
+    }
+
+    /**
+     * A checkpoint belonging to another job is somebody's unfinished work:
+     * refuse, and leave the file exactly as it was.
+     */
+    public function testResumeRefusesAForeignCheckpointWithoutTouchingIt(): void
+    {
+        $checkpoint = tempnam(sys_get_temp_dir(), 'pcckpt_');
+        self::assertIsString($checkpoint);
+        @unlink($checkpoint);
+
+        $jobA = password_hash('999999', PASSWORD_BCRYPT, ['cost' => 8]);
+        $first = $this->runCli([
+            '--hash', $jobA, '--full', '--workers', '2', '--checkpoint', $checkpoint,
+            '--max-hours', '0.0003', '--guard', '0', '--quiet',
+        ]);
+        self::assertSame(3, $first['code'], $first['output']);
+
+        $original = (string) file_get_contents($checkpoint);
+        self::assertNotSame('', $original);
+
+        $jobB = password_hash('888888', PASSWORD_BCRYPT, ['cost' => 8]);
+        $second = $this->runCli([
+            '--hash', $jobB, '--full', '--workers', '2', '--checkpoint', $checkpoint,
+            '--resume', '--guard', '0', '--quiet',
+        ]);
+
+        self::assertSame(2, $second['code'], $second['output']);
+        self::assertStringContainsString('belongs to a different job', $second['output']);
+        self::assertSame(
+            $original,
+            (string) file_get_contents($checkpoint),
+            'the foreign checkpoint must be left untouched'
+        );
+
+        @unlink($checkpoint);
+    }
+
+    public function testRawDigestsGetACappedWorkerCountWithAnExplanation(): void
+    {
+        $result = $this->runCli(['--hash', md5('1234'), '--digits', '4']);
+
+        self::assertSame(0, $result['code'], $result['output']);
+        self::assertStringContainsString('raw digests gain nothing from many workers', $result['output']);
+        self::assertStringContainsString('RECOVERED : 1234', $result['output']);
+    }
+
+    public function testBadMaskIsAUsageErrorNotARuntimeError(): void
+    {
+        $result = $this->runCli(['--hash', md5('x'), '--mask', '?z', '--quiet']);
+
+        self::assertSame(2, $result['code']);
+        self::assertStringContainsString('unknown mask token', $result['output']);
+    }
+
+    /**
+     * End-to-end proof that the throughput guard controls the workers.
+     *
+     * This is the test whose absence hid the original bug: the guard's
+     * decision logic was unit-tested and correct, while the parent only ever
+     * called sleep() on itself. The message said "pausing 120 s to cool down"
+     * and all N workers kept hashing at 100%.
+     *
+     * Driving one worker through the real `--worker --job` entry point is the
+     * only way to observe it, so that is what this does.
+     */
+    public function testPauseFileActuallyStopsAWorkerHashing(): void
+    {
+        $dir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'pcguard_' . getmypid() . '_' . bin2hex(random_bytes(3));
+        self::assertTrue(@mkdir($dir, 0700, true) || is_dir($dir));
+
+        $candidates = $dir . DIRECTORY_SEPARATOR . 'cand.txt';
+        $handle = fopen($candidates, 'wb');
+        self::assertIsResource($handle);
+        for ($i = 0; $i < 20000; $i++) {
+            fwrite($handle, sprintf('%06d', $i) . "\n");
+        }
+        fclose($handle);
+
+        $status = $dir . DIRECTORY_SEPARATOR . 'w.json';
+        $pause = $dir . DIRECTORY_SEPARATOR . 'PAUSE';
+        $beat = $dir . DIRECTORY_SEPARATOR . 'HEARTBEAT';
+        $job = $dir . DIRECTORY_SEPARATOR . 'job.json';
+        touch($beat);
+
+        Json::writeAtomic($job, [
+            'candidate_path' => $candidates,
+            'record_length' => 7,
+            'index_path' => null,
+            'from' => 0,
+            'to' => 20000,
+            'status_path' => $status,
+            'stop_path' => $dir . DIRECTORY_SEPARATOR . 'STOP',
+            'pause_path' => $pause,
+            'heartbeat_path' => $beat,
+            'heartbeat_timeout' => 30,
+            'hash' => password_hash('not-in-the-list', PASSWORD_BCRYPT, ['cost' => 5]),
+            'verifier' => [],
+        ]);
+
+        $worker = proc_open(
+            [PHP_BINARY, self::BIN, '--worker', '--job', $job],
+            [1 => ['file', Filesystem::devNull(), 'a'], 2 => ['file', Filesystem::devNull(), 'a']],
+            $pipes
+        );
+        self::assertIsResource($worker);
+
+        try {
+            usleep(2_000_000);
+            self::assertGreaterThan(0, $this->triedSoFar($status), 'the worker should be hashing');
+
+            touch($pause);
+            usleep(1_500_000);
+            $atPause = $this->triedSoFar($status);
+
+            for ($i = 0; $i < 6; $i++) {
+                usleep(500_000);
+                touch($beat);
+            }
+            $afterWaiting = $this->triedSoFar($status);
+
+            self::assertSame(
+                $atPause,
+                $afterWaiting,
+                'a paused worker must not verify another candidate'
+            );
+
+            @unlink($pause);
+            usleep(2_500_000);
+            touch($beat);
+
+            self::assertGreaterThan(
+                $afterWaiting,
+                $this->triedSoFar($status),
+                'the worker must resume once the pause is lifted'
+            );
+        } finally {
+            @proc_terminate($worker);
+            @proc_close($worker);
+            foreach (glob($dir . DIRECTORY_SEPARATOR . '*') ?: [] as $file) {
+                @unlink($file);
+            }
+            @rmdir($dir);
+        }
+    }
+
+    private function triedSoFar(string $statusPath): int
+    {
+        $status = Json::readSafe($statusPath);
+        self::assertIsArray($status, 'the worker should have written a status file');
+
+        return (int) ($status['tried'] ?? 0);
     }
 }

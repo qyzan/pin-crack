@@ -14,19 +14,28 @@ use PinCrack\Support\System;
 use RuntimeException;
 
 /**
- * Parent process: partitions the candidate list into contiguous ranges, starts
- * one worker per range and tracks progress by polling their status files.
+ * Parent process: partitions the candidate list into contiguous shards and
+ * runs a pool of worker processes over them, tracking progress by polling
+ * their status files.
+ *
+ * Shards are a property of the candidate list; the worker count only limits
+ * how many run at once. That separation is what lets `--workers 8 --resume`
+ * continue a sweep that was started with `--workers 12`.
  *
  * There are no pipes anywhere. Worker stdout/stderr go to a log file, so no
  * pipe can fill up and block, and there is no stream_select() - which does not
  * work on proc_open pipes on Windows. See WorkerRunner for the history.
+ *
+ * @phpstan-import-type Shard from ShardPlanner
  */
 final class ParallelCracker
 {
     private const POLL_INTERVAL_US = 400_000;
+    private const PAUSE_POLL_US = 250_000;
     private const RATE_WINDOW_SECONDS = 90.0;
     private const CHECKPOINT_EVERY_SECONDS = 30.0;
     private const SETTLE_SECONDS = 10.0;
+    private const HEARTBEAT_TIMEOUT = 30;
 
     public function __construct(
         private readonly string $entryPoint,
@@ -37,10 +46,10 @@ final class ParallelCracker
     public function crack(CandidateSet $set, string $hash, CrackOptions $options): CrackResult
     {
         $total = $set->count;
-        $workers = max(1, $options->workers);
+        $poolSize = max(1, $options->workers);
         $checkpoint = $options->checkpoint;
 
-        /** @var list<array{from: int, to: int, pos: int}> $shards */
+        /** @var list<Shard> $shards */
         $shards = [];
         $priorTried = 0;
         $priorElapsed = 0.0;
@@ -67,53 +76,61 @@ final class ParallelCracker
                 $resumed = $shards !== [];
 
                 if ($resumed) {
-                    $remaining = 0;
-                    foreach ($shards as $shard) {
-                        $remaining += max(0, $shard['to'] - $shard['pos']);
-                    }
                     $this->console->info(sprintf(
-                        "  resuming from checkpoint: %s candidates already tested, %s left\n",
+                        "  resuming from checkpoint: %s candidates already tested, %s left"
+                        . " across %d shards, %d at a time\n",
                         Format::number($priorTried),
-                        Format::number($remaining)
+                        Format::number(ShardPlanner::remaining($shards)),
+                        count(ShardPlanner::pendingKeys($shards)),
+                        $poolSize
                     ));
                 }
             }
         }
 
         if ($shards === []) {
-            $perWorker = (int) ceil($total / $workers);
-            for ($i = 0; $i < $workers; $i++) {
-                $from = $i * $perWorker;
-                $to = min($total, $from + $perWorker);
-                if ($from >= $to) {
-                    break;
-                }
-                $shards[] = ['from' => $from, 'to' => $to, 'pos' => $from];
-            }
+            $shards = ShardPlanner::split($total, $poolSize);
         }
 
-        $pending = [];
-        foreach ($shards as $key => $shard) {
-            if ($shard['pos'] < $shard['to']) {
-                $pending[$key] = true;
-            }
-        }
-
-        if ($pending === []) {
+        $queue = ShardPlanner::pendingKeys($shards);
+        if ($queue === []) {
             return new CrackResult(null, $priorTried, $priorElapsed, -1, null, true, 0, true);
         }
 
         $dir = Filesystem::tempDir('pincrack_');
         $stopFile = $dir . DIRECTORY_SEPARATOR . 'STOP';
+        $pauseFile = $dir . DIRECTORY_SEPARATOR . 'PAUSE';
+        $heartbeatFile = $dir . DIRECTORY_SEPARATOR . 'HEARTBEAT';
         $logFile = $dir . DIRECTORY_SEPARATOR . 'worker.log';
         $devNull = Filesystem::devNull();
 
-        /** @var array<int, resource> $procs */
-        $procs = [];
+        // The first heartbeat must exist before any worker starts looking for
+        // it, or a worker can decide it is already orphaned.
+        @touch($heartbeatFile);
+
+        /** @var array<int, resource> $running */
+        $running = [];
         /** @var array<int, string> $statusFiles */
         $statusFiles = [];
+        $spawnFailures = 0;
+        $everStarted = 0;
 
-        foreach (array_keys($pending) as $key) {
+        $spawn = function (int $key) use (
+            &$running,
+            &$statusFiles,
+            &$spawnFailures,
+            &$everStarted,
+            &$shards,
+            $dir,
+            $set,
+            $hash,
+            $options,
+            $stopFile,
+            $pauseFile,
+            $heartbeatFile,
+            $logFile,
+            $devNull
+        ): void {
             $statusFiles[$key] = $dir . DIRECTORY_SEPARATOR . "w$key.json";
             $jobFile = $dir . DIRECTORY_SEPARATOR . "job$key.json";
 
@@ -126,7 +143,10 @@ final class ParallelCracker
                 $statusFiles[$key],
                 $stopFile,
                 $hash,
-                $options->verifierOptions
+                $options->verifierOptions,
+                $pauseFile,
+                $heartbeatFile,
+                self::HEARTBEAT_TIMEOUT
             ))->writeTo($jobFile);
 
             $command = [PHP_BINARY, $this->entryPoint, '--worker', '--job', $jobFile];
@@ -138,20 +158,18 @@ final class ParallelCracker
 
             $process = @proc_open($command, $spec, $pipes);
             if (!is_resource($process)) {
-                continue;
+                $spawnFailures++;
+
+                return;
             }
 
             if ($options->priority !== Priority::NORMAL) {
                 System::lowerPriority((int) proc_get_status($process)['pid'], $options->priority);
             }
-            $procs[$key] = $process;
-        }
 
-        if ($procs === []) {
-            Filesystem::removeTree($dir);
-
-            throw new RuntimeException('no worker could be started');
-        }
+            $running[$key] = $process;
+            $everStarted++;
+        };
 
         $guard = new ThroughputGuard($options->guardPercent, $options->cooldownSeconds);
 
@@ -178,40 +196,29 @@ final class ParallelCracker
         };
 
         while (true) {
-            usleep(self::POLL_INTERVAL_US);
-            $now = microtime(true);
-
-            $sumTried = 0;
-            $allDone = true;
-
-            foreach ($statusFiles as $key => $file) {
-                $status = Json::readSafe($file);
-                if ($status === null) {
-                    $allDone = false;
-                    continue;
-                }
-
-                $shards[$key]['pos'] = max($shards[$key]['pos'], (int) ($status['pos'] ?? $shards[$key]['pos']));
-                $sumTried += (int) ($status['tried'] ?? 0);
-
-                // Record the hit, but do NOT break out of this loop here.
-                //
-                // An earlier version broke immediately, so shards after the
-                // finding one were left out of the sum and "tried" came out
-                // too low. On a real sweep the secret sat in shard 9 of 12 and
-                // the final report lost 154,820 candidates (3 shards) -
-                // printing 23.63 H/s where the true figure was 31.29 H/s.
-                if (($status['found'] ?? null) !== null && $found === null) {
-                    $found = (string) $status['found'];
-                    $foundIndex = (int) ($status['index'] ?? -1);
-                }
-
-                if (($status['done'] ?? false) !== true) {
-                    $allDone = false;
-                }
+            while (count($running) < $poolSize && $queue !== []) {
+                $spawn((int) array_shift($queue));
             }
 
-            $tried = $priorTried + $sumTried;
+            if ($running === []) {
+                if ($everStarted === 0) {
+                    Filesystem::removeTree($dir);
+
+                    throw new RuntimeException('no worker could be started');
+                }
+                if ($queue === []) {
+                    break;
+                }
+                // Every spawn attempt failed but shards remain.
+                $stopped = 'could not start a worker for the remaining shards';
+                break;
+            }
+
+            usleep(self::POLL_INTERVAL_US);
+            $now = microtime(true);
+            @touch($heartbeatFile);
+
+            $tried = $priorTried + $this->collectStatuses($statusFiles, $shards, $found, $foundIndex);
 
             if ($found !== null) {
                 // Ask the other workers to stop and give them a moment to
@@ -222,41 +229,32 @@ final class ParallelCracker
                 $deadline = microtime(true) + 1.0;
                 while (microtime(true) < $deadline) {
                     usleep(100_000);
-
-                    if (!$this->anyRunning($procs)) {
+                    @touch($heartbeatFile);
+                    if (!$this->anyRunning($running)) {
                         break;
                     }
                 }
-
-                $sumTried = 0;
-                foreach ($statusFiles as $key => $file) {
-                    $status = Json::readSafe($file);
-                    if ($status === null) {
-                        continue;
-                    }
-                    $shards[$key]['pos'] = max($shards[$key]['pos'], (int) ($status['pos'] ?? 0));
-                    $sumTried += (int) ($status['tried'] ?? 0);
-                }
-                $tried = $priorTried + $sumTried;
+                $tried = $priorTried + $this->collectStatuses($statusFiles, $shards, $found, $foundIndex);
 
                 break;
             }
 
-            $anyAlive = $this->anyRunning($procs);
+            foreach ($running as $key => $process) {
+                if (proc_get_status($process)['running']) {
+                    continue;
+                }
 
-            if ($allDone) {
-                break;
+                proc_close($process);
+                unset($running[$key]);
+
+                $status = Json::readSafe($statusFiles[$key]);
+                $cleanStop = is_array($status) && ($status['stopped'] ?? false) === true;
+                if (!$cleanStop && $shards[$key]['pos'] < $shards[$key]['to']) {
+                    $stopped = 'a worker exited before finishing its range';
+                }
             }
 
-            if (!$anyAlive) {
-                // Every worker has exited but some range is unfinished: do not
-                // wait forever, report what actually happened.
-                foreach ($shards as $shard) {
-                    if ($shard['pos'] < $shard['to']) {
-                        $stopped = 'a worker exited before finishing its range';
-                        break;
-                    }
-                }
+            if ($stopped !== null) {
                 break;
             }
 
@@ -279,18 +277,21 @@ final class ParallelCracker
             $rate = $windowRate > 0 ? $windowRate : $averageRate;
 
             if ($guard->shouldPause($now, $windowRate, $now - $t0, $total - $tried, $total)) {
-                $this->console->clearLine();
-                $this->console->info(sprintf(
-                    "  [guard] %.1f H/s stayed below %d%% of the %.1f H/s peak for %d s"
-                    . " - pausing %d s to cool down\n",
+                $this->coolDown(
+                    $guard,
+                    $pauseFile,
+                    $heartbeatFile,
+                    $statusFiles,
+                    $shards,
+                    $found,
+                    $foundIndex,
+                    $tried,
+                    $priorTried,
                     $windowRate,
-                    $guard->percent(),
-                    $guard->bestRate(),
-                    (int) $guard->slowFor($now),
-                    $guard->cooldownSeconds()
-                ));
-                sleep($guard->cooldownSeconds());
-                $guard->reset($windowRate);
+                    $save,
+                    $t0,
+                    $options->maxSeconds
+                );
                 $window = [];
             }
 
@@ -307,7 +308,8 @@ final class ParallelCracker
                     $rate,
                     $averageRate,
                     ($now - $t0) >= self::SETTLE_SECONDS && $rate > 0,
-                    count($procs),
+                    count($running),
+                    count($queue),
                     $options->priority,
                     $guard->cooldowns()
                 );
@@ -322,32 +324,30 @@ final class ParallelCracker
                 $deadline = microtime(true) + 3.0;
                 while (microtime(true) < $deadline) {
                     usleep(200_000);
+                    @touch($heartbeatFile);
                 }
-                foreach ($statusFiles as $key => $file) {
-                    $status = Json::readSafe($file);
-                    if ($status !== null) {
-                        $shards[$key]['pos'] = max($shards[$key]['pos'], (int) ($status['pos'] ?? 0));
-                    }
-                }
+                $tried = $priorTried + $this->collectStatuses($statusFiles, $shards, $found, $foundIndex);
+
                 break;
             }
         }
 
         // No pipes are attached, so terminating a worker is safe.
+        @unlink($pauseFile);
         @touch($stopFile);
-        foreach ($procs as $process) {
+        foreach ($running as $process) {
             @proc_terminate($process);
         }
 
         $deadline = microtime(true) + 2.0;
         while (microtime(true) < $deadline) {
-            if (!$this->anyRunning($procs)) {
+            if (!$this->anyRunning($running)) {
                 break;
             }
             usleep(100_000);
         }
 
-        foreach ($procs as $process) {
+        foreach ($running as $process) {
             @proc_close($process);
         }
 
@@ -365,17 +365,11 @@ final class ParallelCracker
                 $this->console->info('    ' . $line . "\n");
             }
         }
-
-        $complete = $found !== null;
-        if (!$complete && $stopped === null) {
-            $complete = true;
-            foreach ($shards as $shard) {
-                if ($shard['pos'] < $shard['to']) {
-                    $complete = false;
-                    break;
-                }
-            }
+        if ($spawnFailures > 0) {
+            $this->console->info(sprintf("  note: %d worker(s) could not be started\n", $spawnFailures));
         }
+
+        $complete = $found !== null || ($stopped === null && ShardPlanner::isComplete($shards));
 
         return new CrackResult(
             $found,
@@ -387,6 +381,119 @@ final class ParallelCracker
             $guard->cooldowns(),
             $resumed
         );
+    }
+
+    /**
+     * Read every status file, update shard positions and return the summed
+     * candidate count.
+     *
+     * A hit is recorded but does NOT stop the sweep over the status files. An
+     * earlier version broke out immediately, so shards after the finding one
+     * were left out of the sum and "tried" came out too low. On a real sweep
+     * the secret sat in shard 9 of 12 and the final report lost 154,820
+     * candidates - printing 23.63 H/s where the true figure was 31.29 H/s.
+     *
+     * @param array<int, string> $statusFiles
+     * @param list<Shard>        $shards
+     */
+    private function collectStatuses(
+        array $statusFiles,
+        array &$shards,
+        ?string &$found,
+        int &$foundIndex
+    ): int {
+        $sumTried = 0;
+
+        foreach ($statusFiles as $key => $file) {
+            if (!isset($shards[$key])) {
+                continue;
+            }
+
+            $status = Json::readSafe($file);
+            if ($status === null) {
+                continue;
+            }
+
+            $shards[$key]['pos'] = max($shards[$key]['pos'], (int) ($status['pos'] ?? $shards[$key]['pos']));
+            $sumTried += (int) ($status['tried'] ?? 0);
+
+            if (($status['found'] ?? null) !== null && $found === null) {
+                $found = (string) $status['found'];
+                $foundIndex = (int) ($status['index'] ?? -1);
+            }
+        }
+
+        return $sumTried;
+    }
+
+    /**
+     * Actually take load off the CPU.
+     *
+     * The parent creates the PAUSE file, which every worker polls at its
+     * reporting cadence and then idles on. An earlier version only called
+     * sleep() in the parent: the message said "pausing 120 s to cool down"
+     * while all N workers kept hashing at 100%, so the guard did nothing at
+     * all. It also froze the display and skipped checkpoints for the whole
+     * pause, and could overshoot --max-hours by a full cooldown.
+     *
+     * The heartbeat keeps being touched here, otherwise paused workers would
+     * conclude the parent had died.
+     *
+     * @param array<int, string>            $statusFiles
+     * @param list<Shard>                   $shards
+     * @param callable(bool=): void         $save
+     */
+    private function coolDown(
+        ThroughputGuard $guard,
+        string $pauseFile,
+        string $heartbeatFile,
+        array $statusFiles,
+        array &$shards,
+        ?string &$found,
+        int &$foundIndex,
+        int &$tried,
+        int $priorTried,
+        float $windowRate,
+        callable $save,
+        float $t0,
+        int $maxSeconds
+    ): void {
+        @touch($pauseFile);
+
+        $this->console->clearLine();
+        $this->console->info(sprintf(
+            "  [guard] %.1f H/s stayed below %d%% of the %.1f H/s peak"
+            . " - pausing %d workers for %d s to cool down\n",
+            $windowRate,
+            $guard->percent(),
+            $guard->bestRate(),
+            count($statusFiles),
+            $guard->cooldownSeconds()
+        ));
+
+        $resumeAt = microtime(true) + $guard->cooldownSeconds();
+        $lastSave = microtime(true);
+
+        while (microtime(true) < $resumeAt) {
+            usleep(self::PAUSE_POLL_US);
+            @touch($heartbeatFile);
+
+            // Keep the checkpoint current: a crash during a two-minute pause
+            // should not cost more than any other moment of the run.
+            if (microtime(true) - $lastSave > self::CHECKPOINT_EVERY_SECONDS) {
+                $tried = $priorTried + $this->collectStatuses($statusFiles, $shards, $found, $foundIndex);
+                $save();
+                $lastSave = microtime(true);
+            }
+
+            // A pause must not swallow the time limit.
+            if ($maxSeconds > 0 && (microtime(true) - $t0) >= $maxSeconds) {
+                break;
+            }
+        }
+
+        @unlink($pauseFile);
+        $guard->reset($windowRate);
     }
 
     /**
@@ -417,7 +524,8 @@ final class ParallelCracker
         float $rate,
         float $averageRate,
         bool $settled,
-        int $workers,
+        int $running,
+        int $queued,
         string $priority,
         int $cooldowns
     ): void {
@@ -440,9 +548,10 @@ final class ParallelCracker
                 $settled ? Format::eta($left) : '?'
             ),
             sprintf(
-                '  %d workers @ %s priority%s',
-                $workers,
+                '  %d workers @ %s priority%s%s',
+                $running,
                 $priority,
+                $queued > 0 ? sprintf('   %d shards queued', $queued) : '',
                 $cooldowns > 0 ? "   cooldowns: $cooldowns" : ''
             ),
         ]);

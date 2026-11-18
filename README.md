@@ -62,7 +62,7 @@ A real run against bcrypt cost 12 — the full output, nothing trimmed:
 ```console
 $ php bin/pin-crack --hash-file hashes.txt --workers 12
 
-pin-crack 4.0.0 - offline secret recovery
+pin-crack 5.0.0 - offline secret recovery
 ----------------------------------------------------------------
   candidates : 3,469  (built-in common wordlist)
   list file  : 23.7 KiB, fixed records
@@ -191,15 +191,32 @@ assumes that and is built to survive it:
 | Flag | What it does |
 |---|---|
 | `--max` | idle-machine profile: **measures** the best worker count, lowers priority, enables checkpointing and the guard |
-| `--checkpoint F` / `--resume` | progress survives a reboot, a closed lid, a killed terminal |
+| `--checkpoint F` / `--resume` | progress survives a reboot, a closed lid, a killed terminal — at any `--workers` value |
 | `--max-hours N` | stop cleanly after N hours with progress saved — exit code `3`, not a lie |
 | `--priority below\|idle\|normal` | OS priority, so the machine stays usable while it works |
-| `--guard PCT` / `--cooldown N` | pause when sustained throughput collapses from thermal or power limits |
-| `--max-candidates N` | refuse an absurd keyspace *before* writing hundreds of MB to disk |
+| `--guard PCT` / `--cooldown N` | **pause every worker** when sustained throughput collapses from thermal or power limits |
+| `--max-candidates N` | refuse an absurd keyspace *before* writing a byte to disk |
+
+Two properties matter for runs you walk away from:
+
+- **Workers cannot outlive their parent.** The parent touches a heartbeat file;
+  a worker that sees it go stale exits by itself. Before this, killing the
+  parent left every worker hashing — measured, 4 of 4 still burning CPU.
+- **The shard plan is independent of the worker count.** You can stop a
+  12-worker sweep and resume it with `--workers 4`; nothing is re-tested and
+  nothing is lost.
 
 `--max` measures instead of assuming, because more workers than cores often
-helps less than you would expect — on the laptop above, 12 workers reach only
-**24% of linear** scaling.
+helps less than you would expect. Measured on the laptop above, bcrypt cost 12:
+
+| workers | 1 | 6 | 8 | **10** | 12 | 16 |
+|---|--:|--:|--:|--:|--:|--:|
+| H/s | 2.97 | 10.42 | 13.26 | **15.81** | 14.02 | 15.86 |
+
+Ten workers beat twelve. That is why the default is `logical processors - 2`
+rather than one per thread, and why raw digests are capped lower still — a full
+md5 keyspace finishes in 1.35 s with four workers and 1.84 s with twelve,
+because there the cost is file and process overhead, not hashing.
 
 ## Output you can pipe
 
@@ -216,7 +233,7 @@ clean file while the display still reaches your terminal.
 ```json
 {
   "tool": "pin-crack",
-  "version": "4.0.0",
+  "version": "5.0.0",
   "source": "built-in common wordlist",
   "candidates": 3469,
   "workers": 12,
@@ -247,8 +264,9 @@ clean file while the display still reaches your terminal.
 |:--:|---|
 | `0` | something was recovered |
 | `1` | nothing was — and the whole candidate list was covered |
-| `2` | usage error |
+| `2` | usage error — a bad flag, an impossible mask, an oversized source |
 | `3` | stopped early, progress saved, rerun with `--resume` |
+| `4` | runtime error — out of disk, unreadable file, no worker could start |
 
 `1` and `3` are **different answers**. `1` means the source was exhausted;
 `3` means you do not know yet. Writing up a `3` as "not recoverable" is how a
@@ -272,10 +290,15 @@ result survives a client pushing back.
 - **Rate and ETA are withheld for ten seconds.** Dividing a start-up burst by a
   very short interval produces "3557 H/s, 4.7 min left" for a job that is
   really hours long. A missing ETA beats a fictional one.
-- **Checkpoints are refused unless hash, source, candidate count and worker
-  count all match.** Silently resuming a different job would report coverage
-  that never happened, and coverage is the one number this exercise exists to
-  produce.
+- **A checkpoint from another job is refused, not overwritten.** It must match
+  the hash, the candidate source and the candidate count; resuming a different
+  job silently would report coverage that never happened, and coverage is the
+  one number this exercise exists to produce. The file itself is left alone,
+  because it is somebody's unfinished work.
+- **The throughput guard has an end-to-end test**, not just a unit test of its
+  decision logic. In 4.0.0 that logic was correct and the guard still did
+  nothing: the parent slept while every worker kept hashing. A green unit test
+  is not evidence that a feature works.
 - **GPU figures are marked as estimates**, because this tool did not measure
   them.
 
@@ -291,15 +314,16 @@ remediation to recommend — and why "raise the bcrypt cost" is not it.
   hash + source → │  CandidateBuilder → candidates on disk   │
                   │  fixed-width records, or + offset index  │
                   └────────────────────┬─────────────────────┘
-                                       │ contiguous ranges
+                                       │ ShardPlanner: contiguous shards,
+                                       │ a plan independent of pool size
             ┌──────────────┬───────────┴──┬──────────────┐
             ▼              ▼              ▼              ▼
         worker 0       worker 1       worker 2  …    worker N      ← own PHP
-        fseek→range    fseek→range    fseek→range    fseek→range     processes
-            │              │              │              │
+        fseek→shard    fseek→shard    fseek→shard    fseek→shard     processes,
+            │              │              │              │           pooled
             └──────────────┴──────┬───────┴──────────────┘
-                                  │ atomic JSON status files
-                                  ▼                              (no pipes.
+          status ▲ (atomic JSON)  │  ▼ STOP · PAUSE · HEARTBEAT
+                                  │                              (no pipes.
                      ParallelCracker (parent)                     ever.)
                      polls · rate window · guard · checkpoint
 ```
@@ -315,9 +339,14 @@ remediation to recommend — and why "raise the bcrypt cost" is not it.
   pipes anywhere — `stream_select()` and non-blocking mode do not work on
   `proc_open` pipes on Windows, and the pipe-based version lost messages and
   hung the parent. This is the single most important decision in the codebase.
-- **The target hash reaches workers in a job file**, inside a `0700` temporary
+- **The target hash reaches workers in a job file**, in a private temporary
   directory, not on the command line — so client material never appears in a
   process listing.
+- **Three control files flow the other way.** `STOP` ends a sweep, `PAUSE`
+  parks the workers for the throughput guard, and `HEARTBEAT` is how a worker
+  tells that its parent is still alive. Each is read with the stat cache
+  cleared first, because PHP caches successful `stat()` calls and a worker
+  would otherwise never notice `PAUSE` being removed.
 
 Design, trade-offs and the bug history behind each choice:
 **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**

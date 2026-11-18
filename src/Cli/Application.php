@@ -22,6 +22,7 @@ use PinCrack\Support\System;
 use PinCrack\Verify\HashIdentifier;
 use PinCrack\Verify\VerifierFactory;
 use PinCrack\Version;
+use InvalidArgumentException;
 use Throwable;
 
 final class Application
@@ -30,8 +31,19 @@ final class Application
     public const EXIT_NOT_FOUND = 1;
     public const EXIT_USAGE = 2;
     public const EXIT_INCOMPLETE = 3;
+    public const EXIT_ERROR = 4;
 
     private const DEFAULT_CHECKPOINT = '.pin-crack-progress.json';
+
+    /**
+     * Worker cap for raw digests.
+     *
+     * Measured: a full 6-digit md5 keyspace takes 1.35 s with one worker and
+     * with four, but 1.84 s with twelve. For cheap hashes the per-candidate
+     * cost is file and process overhead rather than hashing, so extra
+     * processes only add contention.
+     */
+    private const DIGEST_WORKER_CAP = 4;
 
     public function __construct(private readonly string $entryPoint)
     {
@@ -71,14 +83,19 @@ final class Application
 
         try {
             return $this->execute($options, $console);
-        } catch (UsageException $e) {
+        } catch (UsageException | InvalidArgumentException $e) {
+            // The operator's inputs do not make sense - a bad mask, an
+            // oversized source, an empty candidate list.
             fwrite(STDERR, 'error: ' . $e->getMessage() . "\n");
 
             return self::EXIT_USAGE;
         } catch (Throwable $e) {
+            // Not a usage problem: a disk filling up or an unreadable file is
+            // not the operator mistyping a flag, and a script branching on the
+            // exit code should be able to tell the two apart.
             fwrite(STDERR, 'error: ' . $e->getMessage() . "\n");
 
-            return self::EXIT_USAGE;
+            return self::EXIT_ERROR;
         }
     }
 
@@ -114,12 +131,6 @@ final class Application
         }
 
         $checkpointPath = $this->checkpointPath($options);
-        if ($checkpointPath !== null && !$options->resume && is_file($checkpointPath)) {
-            $console->info("  an older checkpoint exists: $checkpointPath\n");
-            $console->info("  pass --resume to continue it, or delete the file to start over.\n");
-            $console->info("  (without --resume it is OVERWRITTEN when this sweep starts)\n\n");
-            @unlink($checkpointPath);
-        }
 
         $set = $builder->build(Filesystem::tempFile('pincrack_wl_'));
 
@@ -132,8 +143,29 @@ final class Application
             /** @var list<array<string, mixed>> $report */
             $report = [];
 
+            // --max-hours is a budget for the whole invocation, not per hash.
+            // It used to be passed to each target in turn, so ten hashes with
+            // --max-hours 8 could run for eighty hours.
+            $budgetSeconds = (int) ($options->maxHours * 3600);
+            $deadline = $budgetSeconds > 0 ? microtime(true) + $budgetSeconds : 0.0;
+
             foreach ($targets as $target) {
                 $info = HashIdentifier::identify($target->hash);
+
+                if ($deadline > 0.0 && microtime(true) >= $deadline) {
+                    $console->out(sprintf(
+                        "[%s] skipped - the --max-hours budget is spent\n\n",
+                        $target->label
+                    ));
+                    $incomplete = true;
+                    $report[] = [
+                        'label' => $target->label,
+                        'algorithm' => $info['label'],
+                        'skipped' => true,
+                        'stopped' => 'time budget spent',
+                    ];
+                    continue;
+                }
 
                 if (!VerifierFactory::isUsable($target->hash, $options->algo)) {
                     $console->out(sprintf(
@@ -154,15 +186,19 @@ final class Application
                 $checkpoint = (count($targets) === 1 && $checkpointPath !== null)
                     ? new Checkpoint(
                         $checkpointPath,
-                        Checkpoint::signature($target->hash, $set->label, $set->count, $workers)
+                        Checkpoint::signature($target->hash, $set->label, $set->count)
                     )
                     : null;
+
+                if ($checkpoint !== null) {
+                    $this->prepareCheckpoint($checkpoint, $options, $console);
+                }
 
                 $crackOptions = new CrackOptions(
                     workers: $workers,
                     priority: $options->effectivePriority(),
                     checkpoint: $checkpoint,
-                    maxSeconds: (int) ($options->maxHours * 3600),
+                    maxSeconds: $deadline > 0.0 ? max(1, (int) ceil($deadline - microtime(true))) : 0,
                     guardPercent: $options->guard,
                     cooldownSeconds: $options->cooldown,
                     verifierOptions: $options->verifierOptions()
@@ -279,6 +315,20 @@ final class Application
         return ($options->max || $options->full) ? self::DEFAULT_CHECKPOINT : null;
     }
 
+    /**
+     * How many workers to run when the operator did not say.
+     *
+     * Measured on a 12-thread hybrid CPU (2 P-cores + 8 E-cores), bcrypt
+     * cost 12: 10 workers reached 15.81 H/s where 12 reached 14.02 H/s - the
+     * old default of one worker per logical processor was measurably the worse
+     * choice. Leaving two threads free is faster *and* keeps the machine
+     * usable.
+     */
+    public static function defaultWorkers(int $cpuCount): int
+    {
+        return max(1, $cpuCount - 2);
+    }
+
     private function resolveWorkers(Options $options, Console $console, Target $first, int $cpuCount): int
     {
         if ($options->workers !== null) {
@@ -295,7 +345,62 @@ final class Application
             );
         }
 
-        return $cpuCount;
+        if (HashIdentifier::identify($first->hash)['family'] === HashIdentifier::FAMILY_DIGEST) {
+            $workers = max(1, min(self::DIGEST_WORKER_CAP, $cpuCount));
+            $console->info(sprintf(
+                "  note: raw digests gain nothing from many workers, using %d (override with --workers)\n",
+                $workers
+            ));
+
+            return $workers;
+        }
+
+        return self::defaultWorkers($cpuCount);
+    }
+
+    /**
+     * Decide what to do about an existing checkpoint file.
+     *
+     * A checkpoint that belongs to another job is somebody's unfinished work.
+     * It used to be rejected silently and then overwritten by the fresh run,
+     * so a single mistyped flag destroyed hours of progress without a word.
+     * With --resume we now refuse and leave the file alone.
+     */
+    private function prepareCheckpoint(Checkpoint $checkpoint, Options $options, Console $console): void
+    {
+        $status = $checkpoint->status();
+
+        if ($status === Checkpoint::STATUS_MISMATCHED) {
+            if ($options->resume) {
+                throw new UsageException(sprintf(
+                    'the checkpoint at %s belongs to a different job - another hash, candidate source '
+                    . 'or candidate count - so there is nothing here to resume. It has been left '
+                    . 'untouched: delete it, or pass --checkpoint with another path.',
+                    $checkpoint->path()
+                ));
+            }
+
+            $console->info(sprintf(
+                "  checkpoint %s is from a different job and will be overwritten\n",
+                $checkpoint->path()
+            ));
+            $console->info("  (pass --checkpoint with another path to keep it)\n\n");
+            $checkpoint->discard();
+
+            return;
+        }
+
+        if ($status === Checkpoint::STATUS_USABLE && !$options->resume) {
+            $console->info(sprintf("  a resumable checkpoint exists: %s\n", $checkpoint->path()));
+            $console->info("  pass --resume to continue it; without --resume it is overwritten now\n\n");
+            $checkpoint->discard();
+
+            return;
+        }
+
+        if ($status === Checkpoint::STATUS_MISSING && $options->resume) {
+            $console->info("  --resume given, but there is no checkpoint yet; starting from the beginning\n\n");
+        }
     }
 
     private function printHeader(
@@ -416,7 +521,7 @@ final class Application
         $keyspace = $options->mask !== null
             ? (new Mask($options->mask))->count()
             : (int) (10 ** $options->digits);
-        $workers = $options->workers ?? $cpuCount;
+        $workers = $options->workers ?? self::defaultWorkers($cpuCount);
         $benchmark = new Benchmark($this->entryPoint, $console);
 
         $out = static function (string $s): void {

@@ -13,11 +13,21 @@ use PinCrack\Verify\VerifierFactory;
  * Single-process sweep.
  *
  * Used when proc_open() is unavailable (hardened php.ini, some shared
- * hosting) or when the operator explicitly asks for one worker. Slower, but
- * it has no moving parts.
+ * hosting) and whenever one worker is asked for - which, for cheap hashes, is
+ * the fastest configuration there is: a full 6-digit md5 keyspace finishes in
+ * 1.35 s here against 1.84 s with twelve worker processes, because the
+ * per-candidate cost is file and process overhead rather than hashing.
+ *
+ * The throughput guard works here too. It used to be ignored in this path
+ * entirely; since this process *is* the worker, sleeping really does take the
+ * load off.
  */
 final class InlineCracker
 {
+    private const RATE_WINDOW_SECONDS = 90.0;
+    private const CHECKPOINT_EVERY_SECONDS = 30.0;
+    private const CHECK_EVERY_CANDIDATES = 16;
+
     public function __construct(private readonly Console $console)
     {
     }
@@ -49,14 +59,28 @@ final class InlineCracker
                         true
                     );
                 }
-                $start = $state['shards'][0]['pos'] ?? 0;
+                // One process sweeps one range, so resume behind the furthest
+                // shard that is still unfinished.
+                $pending = ShardPlanner::pendingKeys($state['shards']);
+                if ($pending !== []) {
+                    $start = $state['shards'][$pending[0]]['pos'];
+                }
                 $priorTried = $state['tried'];
                 $priorElapsed = $state['elapsed'];
                 $resumed = $start > 0;
+
+                if ($resumed) {
+                    $this->console->info(sprintf(
+                        "  resuming from checkpoint: %s candidates already tested\n",
+                        Format::number($priorTried)
+                    ));
+                }
             }
         }
 
         $reader->seek($start);
+
+        $guard = new ThroughputGuard($options->guardPercent, $options->cooldownSeconds);
 
         $t0 = microtime(true);
         $tried = 0;
@@ -64,6 +88,8 @@ final class InlineCracker
         $lastCheckpoint = $t0;
         $stopped = null;
         $position = $start;
+        /** @var list<array{0: float, 1: int}> $window */
+        $window = [];
 
         for ($i = $start; $i < $total; $i++) {
             $candidate = $reader->next();
@@ -80,10 +106,11 @@ final class InlineCracker
             if ($verifier->verify($candidate)) {
                 $reader->close();
                 $this->console->clearLine();
+                $elapsed = $priorElapsed + (microtime(true) - $t0);
                 $checkpoint?->save(
                     [['from' => 0, 'to' => $total, 'pos' => $total]],
                     $priorTried + $tried,
-                    $priorElapsed + (microtime(true) - $t0),
+                    $elapsed,
                     $candidate,
                     $i
                 );
@@ -91,13 +118,19 @@ final class InlineCracker
                 return new CrackResult(
                     $candidate,
                     $priorTried + $tried,
-                    $priorElapsed + (microtime(true) - $t0),
+                    $elapsed,
                     $i,
                     null,
                     true,
-                    0,
+                    $guard->cooldowns(),
                     $resumed
                 );
+            }
+
+            // Clock calls and file writes are expensive relative to a cheap
+            // hash, so only look at the time every few candidates.
+            if ($tried % self::CHECK_EVERY_CANDIDATES !== 0) {
+                continue;
             }
 
             $now = microtime(true);
@@ -107,7 +140,44 @@ final class InlineCracker
                 break;
             }
 
-            if ($checkpoint !== null && $now - $lastCheckpoint > 30) {
+            $window[] = [$now, $tried];
+            while (count($window) > 2 && $now - $window[0][0] > self::RATE_WINDOW_SECONDS) {
+                array_shift($window);
+            }
+
+            $windowRate = 0.0;
+            if (count($window) >= 2) {
+                $dt = $window[count($window) - 1][0] - $window[0][0];
+                $dn = $window[count($window) - 1][1] - $window[0][1];
+                if ($dt > 1) {
+                    $windowRate = $dn / $dt;
+                }
+            }
+
+            if ($guard->shouldPause($now, $windowRate, $now - $t0, $total - $position, $total)) {
+                $this->console->clearLine();
+                $this->console->info(sprintf(
+                    "  [guard] %.1f H/s stayed below %d%% of the %.1f H/s peak"
+                    . " - pausing %d s to cool down\n",
+                    $windowRate,
+                    $guard->percent(),
+                    $guard->bestRate(),
+                    $guard->cooldownSeconds()
+                ));
+                $checkpoint?->save(
+                    [['from' => 0, 'to' => $total, 'pos' => $position]],
+                    $priorTried + $tried,
+                    $priorElapsed + ($now - $t0),
+                    null,
+                    -1
+                );
+                sleep($guard->cooldownSeconds());
+                $guard->reset($windowRate);
+                $window = [];
+                $lastCheckpoint = microtime(true);
+            }
+
+            if ($checkpoint !== null && $now - $lastCheckpoint > self::CHECKPOINT_EVERY_SECONDS) {
                 $checkpoint->save(
                     [['from' => 0, 'to' => $total, 'pos' => $position]],
                     $priorTried + $tried,
@@ -119,7 +189,8 @@ final class InlineCracker
             }
 
             if ($now - $lastDraw > 1.0) {
-                $this->draw($priorTried + $tried, $total, $priorElapsed + ($now - $t0), $tried / max($now - $t0, 1e-9));
+                $rate = $windowRate > 0 ? $windowRate : $tried / max($now - $t0, 1e-9);
+                $this->draw($priorTried + $tried, $total, $priorElapsed + ($now - $t0), $rate);
                 $lastDraw = $now;
             }
         }
@@ -143,7 +214,7 @@ final class InlineCracker
             -1,
             $stopped,
             $stopped === null && $position >= $total,
-            0,
+            $guard->cooldowns(),
             $resumed
         );
     }

@@ -37,6 +37,22 @@ php bin/pin-crack --hash-file hashes.txt --full --json --out recovered.txt
 php bin/pin-crack --hash '$2y$12$...' --bench
 ```
 
+## Aman dijalankan lama?
+
+Sejak v5.0.0, ya — tiga bug yang membuatnya tidak aman sudah diperbaiki:
+
+- **Guard throughput benar-benar menghentikan worker** sekarang. Sebelumnya
+  parent hanya `sleep()` sendiri sementara semua worker tetap menghashing
+  100%, jadi perlindungan termalnya kosong.
+- **Worker tidak bisa hidup lebih lama dari parent-nya.** Parent menyentuh
+  berkas heartbeat; worker yang melihatnya basi akan keluar sendiri. Dulu
+  parent dibunuh = semua worker tetap jalan (terukur: 4 dari 4).
+- **Checkpoint tidak lagi hangus** kalau jumlah worker berubah, dan checkpoint
+  milik pekerjaan lain ditolak, bukan ditimpa.
+
+Jumlah worker bawaan sekarang `prosesor logis - 2`, karena pada mesin uji 10
+worker (15,81 H/s) terukur lebih cepat daripada 12 (14,02 H/s).
+
 ## Catatan untuk laporan pengujian
 
 - Urutan kandidat bawaan disusun dari yang paling umum, dan posisi temuan

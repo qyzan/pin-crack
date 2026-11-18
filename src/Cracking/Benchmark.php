@@ -92,11 +92,17 @@ final class Benchmark
      */
     public function autoTuneWorkers(string $hash, int $cpuCount, array $verifierOptions = [], int $seconds = 15): int
     {
+        // Includes cpuCount - 2, because on a hybrid CPU that was measurably
+        // the best of the lot: 10 workers gave 15.81 H/s where 12 gave 14.02.
+        // An earlier candidate set of {half, three quarters, all} could not
+        // even express it.
         $candidates = array_values(array_unique(array_filter([
             max(2, intdiv($cpuCount, 2)),
             max(2, (int) round($cpuCount * 0.75)),
+            max(2, $cpuCount - 2),
             $cpuCount,
         ])));
+        sort($candidates);
 
         $best = $cpuCount;
         $bestRate = 0.0;

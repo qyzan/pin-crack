@@ -9,7 +9,7 @@ use PinCrack\Candidates\CandidateSet;
 use PinCrack\Candidates\Mask;
 use PinCrack\Cracking\CandidateReader;
 use PHPUnit\Framework\TestCase;
-use RuntimeException;
+use InvalidArgumentException;
 
 final class CandidateBuilderTest extends TestCase
 {
@@ -127,7 +127,7 @@ final class CandidateBuilderTest extends TestCase
 
     public function testKeyspaceLimitIsEnforcedBeforeAnythingIsWritten(): void
     {
-        $this->expectException(RuntimeException::class);
+        $this->expectException(InvalidArgumentException::class);
         $this->expectExceptionMessageMatches('/max-candidates/');
 
         $this->build(new CandidateBuilder(
@@ -143,7 +143,7 @@ final class CandidateBuilderTest extends TestCase
         self::assertIsString($path);
         file_put_contents($path, "\n\n");
 
-        $this->expectException(RuntimeException::class);
+        $this->expectException(InvalidArgumentException::class);
 
         try {
             $this->build(new CandidateBuilder(

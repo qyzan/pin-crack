@@ -22,18 +22,24 @@ use PinCrack\Verify\VerifierFactory;
  * Now each worker owns its own range and writes progress to a small JSON file
  * (write-then-rename, so it is never read half-written). The parent only reads
  * files. No pipes, no select, no protocol that can lose a message.
+ *
+ * A worker reacts to three things from the parent, all checked at the same
+ * cadence as its progress reports: a stop request, a pause request, and the
+ * parent's heartbeat going stale.
  */
 final class WorkerRunner
 {
     /**
-     * How often a worker publishes its position and checks for a stop
-     * request.
+     * How often a worker publishes its position and checks the control files.
      *
      * Short enough that a sub-second sweep still reports most of the work it
      * did - with a one-second interval, a run that ended in 400 ms reported
      * only the finding worker's count and made "tried" look far too low.
      */
     private const REPORT_EVERY_SECONDS = 0.25;
+
+    /** How long to idle between checks while paused. */
+    private const PAUSE_POLL_US = 500_000;
 
     public function run(WorkerJob $job): int
     {
@@ -64,17 +70,48 @@ final class WorkerRunner
             }
 
             $now = microtime(true);
-            if ($now - $lastReport >= self::REPORT_EVERY_SECONDS) {
-                $this->report($job->statusPath, $i + 1, $tried, false, null);
-                $lastReport = $now;
+            if ($now - $lastReport < self::REPORT_EVERY_SECONDS) {
+                continue;
+            }
+            $lastReport = $now;
 
-                // Stop cleanly when the parent asks; progress is already saved.
-                if ($job->stopPath !== '' && is_file($job->stopPath)) {
-                    $this->report($job->statusPath, $i + 1, $tried, false, null, -1, true);
-                    $reader->close();
+            $this->report($job->statusPath, $i + 1, $tried, false, null);
 
-                    return 0;
+            // The parent is gone: stop rather than becoming an orphan that
+            // hashes for hours with nobody collecting the result.
+            if ($this->parentIsGone($job)) {
+                $this->report($job->statusPath, $i + 1, $tried, false, null, -1, true, 'parent gone');
+                $reader->close();
+
+                return 0;
+            }
+
+            if ($this->stopRequested($job)) {
+                $this->report($job->statusPath, $i + 1, $tried, false, null, -1, true);
+                $reader->close();
+
+                return 0;
+            }
+
+            // Throughput guard: idle until the parent lifts the pause. This is
+            // what actually takes load off the CPU - the parent sleeping on its
+            // own would leave every worker hashing at full tilt.
+            if ($job->pausePath !== '' && $this->existsNow($job->pausePath)) {
+                $this->report($job->statusPath, $i + 1, $tried, false, null, -1, false, 'paused');
+
+                while ($this->existsNow($job->pausePath)) {
+                    usleep(self::PAUSE_POLL_US);
+
+                    if ($this->stopRequested($job) || $this->parentIsGone($job)) {
+                        $this->report($job->statusPath, $i + 1, $tried, false, null, -1, true, 'stopped while paused');
+                        $reader->close();
+
+                        return 0;
+                    }
                 }
+
+                $this->report($job->statusPath, $i + 1, $tried, false, null);
+                $lastReport = microtime(true);
             }
         }
 
@@ -84,6 +121,49 @@ final class WorkerRunner
         return 0;
     }
 
+    /**
+     * is_file() with the stat cache cleared for that one path first.
+     *
+     * PHP caches successful stat() results for the lifetime of the process, so
+     * a plain is_file() loop can keep seeing a file that the parent already
+     * deleted. For the PAUSE file that is the dangerous direction: a worker
+     * would stay parked forever after the cooldown ended.
+     */
+    private function existsNow(string $path): bool
+    {
+        clearstatcache(true, $path);
+
+        return is_file($path);
+    }
+
+    private function stopRequested(WorkerJob $job): bool
+    {
+        return $job->stopPath !== '' && $this->existsNow($job->stopPath);
+    }
+
+    /**
+     * True when the parent's heartbeat is stale or has vanished.
+     *
+     * Heartbeat supervision is opt-in: with no heartbeat path configured a
+     * worker runs unsupervised, which is what the benchmark harness wants.
+     */
+    private function parentIsGone(WorkerJob $job): bool
+    {
+        if ($job->heartbeatPath === '' || $job->heartbeatTimeout <= 0) {
+            return false;
+        }
+
+        clearstatcache(true, $job->heartbeatPath);
+        $touched = @filemtime($job->heartbeatPath);
+
+        if ($touched === false) {
+            // The heartbeat file is gone, and so is whatever created it.
+            return true;
+        }
+
+        return (time() - $touched) > $job->heartbeatTimeout;
+    }
+
     private function report(
         string $path,
         int $pos,
@@ -91,7 +171,8 @@ final class WorkerRunner
         bool $done,
         ?string $found,
         int $index = -1,
-        bool $stopped = false
+        bool $stopped = false,
+        ?string $note = null
     ): void {
         Json::writeAtomic($path, [
             'pos' => $pos,
@@ -100,6 +181,7 @@ final class WorkerRunner
             'found' => $found,
             'index' => $index,
             'stopped' => $stopped,
+            'note' => $note,
         ]);
     }
 }

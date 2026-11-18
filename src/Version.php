@@ -6,7 +6,7 @@ namespace PinCrack;
 
 final class Version
 {
-    public const NUMBER = '4.0.0';
+    public const NUMBER = '5.0.0';
     public const NAME = 'pin-crack';
 
     public static function line(): string

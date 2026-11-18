@@ -147,9 +147,16 @@ php bin/pin-crack --hash '...' --priority idle
 php bin/pin-crack --hash '...' --bench
 ```
 
-- `--workers N` defaults to the number of logical processors. With `N = 1` the
-  single-process path runs, which is also the automatic fallback when
-  `proc_open()` is unavailable.
+- `--workers N` defaults to **logical processors minus two**, and is capped at
+  four for raw digests. Both numbers come from measurement, not taste: on a
+  12-thread hybrid laptop, bcrypt cost 12 ran at 15.81 H/s with ten workers and
+  14.02 H/s with twelve, and a full md5 keyspace took 1.35 s with up to four
+  workers against 1.84 s with twelve. With `N = 1` the single-process path
+  runs, which is also the automatic fallback when `proc_open()` is unavailable
+  — and the fastest option for cheap hashes.
+- Changing `--workers` between runs is safe. The shard plan belongs to the
+  candidate list, not to the pool, so a checkpoint resumes at any worker count
+  without re-testing anything.
 - `--max` is the overnight profile: it measures the best worker count instead
   of assuming it, lowers priority, enables checkpointing and the guard.
 - `--priority below|idle|normal` sets OS priority. On an idle machine this
@@ -167,12 +174,22 @@ php bin/pin-crack --hash '...' --full --no-checkpoint
 ```
 
 Checkpointing is on by default with `--max` or `--full`, writing
-`.pin-crack-progress.json` in the current directory. Without `--resume`, an
-existing checkpoint is reported and then overwritten.
+`.pin-crack-progress.json` in the current directory.
 
 A checkpoint only resumes the job it was written for: the hash, the candidate
-source, the candidate count and the worker count all have to match. Change
-`--workers` and you start over.
+source and the candidate count have to match. The worker count does **not** —
+stop a 12-worker sweep and resume it with `--workers 4` if you like.
+
+What happens to an existing file depends on whether it matches:
+
+| | with `--resume` | without `--resume` |
+|---|---|---|
+| matches this job | resumed | reported, then overwritten |
+| belongs to another job | **refused, left untouched** (exit 2) | reported, then overwritten |
+| missing | noted, starts from the beginning | normal fresh run |
+
+The refusal matters: a mismatched checkpoint is somebody's unfinished sweep. If
+you hit it, delete the file or pass `--checkpoint` with another path.
 
 Checkpointing applies to a single target. With several hashes in one run,
 nothing is checkpointed.
@@ -185,6 +202,16 @@ php bin/pin-crack --hash '...' --full --guard 0
 The guard pauses the sweep when the rate stays below `--guard` percent of the
 observed peak, for at least 60 seconds, after a five-minute warm-up, and only
 while more than 2% of the work is left.
+
+"Pauses the sweep" means every worker stops verifying candidates — the parent
+creates a `PAUSE` file and the workers idle on it. During the pause the
+checkpoint keeps being written and `--max-hours` can still fire, so a cooldown
+is never a blind spot. In single-process mode the guard sleeps the one process,
+which amounts to the same thing.
+
+`--max-hours` is a budget for the **whole invocation**, shared by every hash in
+a `--hash-file`. A target that starts with the budget already spent is skipped
+and reported as such.
 
 ## Output
 
@@ -207,11 +234,13 @@ file while the progress display still reaches the terminal.
 |---|---|
 | 0 | at least one hash recovered |
 | 1 | nothing recovered, and the sweep covered its whole candidate list |
-| 2 | usage error |
+| 2 | usage error: a bad flag, an impossible mask, an oversized source, a foreign checkpoint |
 | 3 | stopped before finishing; progress saved, use `--resume` |
+| 4 | runtime error: out of disk, an unreadable file, no worker could start |
 
 1 and 3 are different answers. `1` means the source was exhausted; `3` means
-you do not know yet.
+you do not know yet. 2 and 4 are also different: `2` is something you typed,
+`4` is something the machine could not do.
 
 ```bash
 php bin/pin-crack --hash "$H" --full --max --max-hours 8 --quiet
@@ -219,6 +248,7 @@ case $? in
   0) echo "recovered" ;;
   1) echo "not in the keyspace searched" ;;
   3) echo "incomplete - rerun with --resume" ;;
+  4) echo "runtime error - check disk space and the log" ;;
   *) echo "usage error" ;;
 esac
 ```

@@ -13,9 +13,19 @@ use RuntimeException;
  * The job goes in a file rather than on the command line so the target hash
  * does not show up in the machine's process list - on a shared or monitored
  * box, `ps` output is not a good place for client material.
+ *
+ * Three control files live alongside it, all polled by the worker at its
+ * reporting cadence:
+ *
+ *   stopPath       exists  -> finish now, progress already reported
+ *   pausePath      exists  -> stop hashing and idle until it disappears
+ *   heartbeatPath  stale   -> the parent is gone, exit rather than orphan
  */
 final class WorkerJob
 {
+    /** Seconds without a parent heartbeat before a worker assumes it is orphaned. */
+    public const DEFAULT_HEARTBEAT_TIMEOUT = 30;
+
     /**
      * @param array<string, mixed> $verifierOptions
      */
@@ -28,7 +38,10 @@ final class WorkerJob
         public readonly string $statusPath,
         public readonly string $stopPath,
         public readonly string $hash,
-        public readonly array $verifierOptions = []
+        public readonly array $verifierOptions = [],
+        public readonly string $pausePath = '',
+        public readonly string $heartbeatPath = '',
+        public readonly int $heartbeatTimeout = self::DEFAULT_HEARTBEAT_TIMEOUT
     ) {
     }
 
@@ -43,6 +56,9 @@ final class WorkerJob
             'to' => $this->to,
             'status_path' => $this->statusPath,
             'stop_path' => $this->stopPath,
+            'pause_path' => $this->pausePath,
+            'heartbeat_path' => $this->heartbeatPath,
+            'heartbeat_timeout' => $this->heartbeatTimeout,
             'hash' => $this->hash,
             'verifier' => $this->verifierOptions,
         ];
@@ -71,7 +87,10 @@ final class WorkerJob
             (string) ($data['status_path'] ?? ''),
             (string) ($data['stop_path'] ?? ''),
             (string) ($data['hash'] ?? ''),
-            is_array($data['verifier'] ?? null) ? $data['verifier'] : []
+            is_array($data['verifier'] ?? null) ? $data['verifier'] : [],
+            (string) ($data['pause_path'] ?? ''),
+            (string) ($data['heartbeat_path'] ?? ''),
+            (int) ($data['heartbeat_timeout'] ?? self::DEFAULT_HEARTBEAT_TIMEOUT)
         );
     }
 }

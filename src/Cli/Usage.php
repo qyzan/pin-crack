@@ -45,7 +45,10 @@ final class Usage
           --iterations N      re-hash the digest N times (default 1)
 
         PERFORMANCE
-          --workers N         number of workers (default: logical processors)
+          --workers N         number of workers (default: logical processors - 2;
+                              capped at 4 for raw digests, which do not benefit
+                              from more). Changing it is safe mid-sweep: a
+                              checkpoint resumes at any worker count.
           --max               idle-machine mode: auto-tune workers, low priority,
                               checkpointing and the throughput guard
           --priority P        below | idle | normal  (default: below with --max)
@@ -54,11 +57,14 @@ final class Usage
         SAFEGUARDS FOR LONG SWEEPS
           --checkpoint F      save progress to F
                               (default with --max / --full: .pin-crack-progress.json)
-          --resume            continue from an existing checkpoint
+          --resume            continue from an existing checkpoint. A checkpoint
+                              belonging to another job is refused, never
+                              overwritten.
           --no-checkpoint     disable checkpointing
-          --max-hours N       stop after N hours (progress is saved)
-          --guard PCT         pause when the rate stays below PCT% of the peak
-                              (default 50, 0 disables)
+          --max-hours N       stop after N hours (progress is saved). This is a
+                              budget for the whole run, shared by every hash.
+          --guard PCT         pause the workers when the rate stays below PCT%
+                              of the peak (default 50, 0 disables)
           --cooldown N        guard pause length in seconds (default 120)
 
         OUTPUT
@@ -83,6 +89,7 @@ final class Usage
           1  nothing recovered (the sweep finished)
           2  usage error
           3  stopped before finishing; progress saved, use --resume
+          4  runtime error (out of disk, unreadable file, no worker could start)
 
         TXT;
     }

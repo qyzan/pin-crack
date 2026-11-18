@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace PinCrack\Candidates;
 
 use InvalidArgumentException;
+use PinCrack\Support\Filesystem;
 use PinCrack\Support\Format;
 use RuntimeException;
 
@@ -61,14 +62,19 @@ final class CandidateBuilder
     public function build(string $path): CandidateSet
     {
         $known = $this->knownCount();
+        // InvalidArgumentException for "your inputs do not make sense" and
+        // RuntimeException for "the machine could not do it": the CLI maps the
+        // first to a usage exit code and the second to a runtime one.
         if ($known !== null && $this->maxCandidates > 0 && $known > $this->maxCandidates) {
-            throw new RuntimeException(sprintf(
+            throw new InvalidArgumentException(sprintf(
                 'that source expands to %s candidates, above the --max-candidates limit of %s. '
                 . 'Raise the limit if you have the disk space and the time.',
                 Format::number($known),
                 Format::number($this->maxCandidates)
             ));
         }
+
+        $this->checkDiskSpace($path, $known);
 
         $writer = new CandidateWriter($path);
 
@@ -95,12 +101,47 @@ final class CandidateBuilder
 
         if ($set->count === 0) {
             $set->cleanup();
-            throw new RuntimeException(
+            throw new InvalidArgumentException(
                 'the candidate list came out empty - check --digits, --mask or your wordlist'
             );
         }
 
         return $set;
+    }
+
+    /**
+     * Refuse a source that cannot fit before writing a single byte.
+     *
+     * Without this, `--digits 10 --full --max-candidates 0` happily starts
+     * writing an 11 GB candidate file and only stops when the disk does.
+     * Only applies where the candidate count is known up front; a streamed
+     * user wordlist cannot be sized in advance.
+     */
+    private function checkDiskSpace(string $path, ?int $known): void
+    {
+        if ($known === null) {
+            return;
+        }
+
+        $recordLength = match ($this->mode) {
+            self::MODE_MASK => ($this->mask?->length() ?? $this->digits) + 1,
+            default => $this->digits + 1,
+        };
+
+        $needed = $known * $recordLength;
+        $free = Filesystem::freeSpace($path);
+
+        if ($free === null || $needed <= $free * 0.95) {
+            return;
+        }
+
+        throw new RuntimeException(sprintf(
+            'that source needs about %s for the candidate list but only %s is free on %s. '
+            . 'Use a narrower source, or point --save-wordlist at another volume.',
+            Format::bytes($needed),
+            Format::bytes($free),
+            dirname($path)
+        ));
     }
 
     /** @param array<string, true> $front */
